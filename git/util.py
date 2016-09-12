@@ -3,10 +3,12 @@
 #
 # This module is part of GitPython and is released under
 # the BSD License: http://www.opensource.org/licenses/bsd-license.php
+
 import contextlib
 from functools import wraps
 import getpass
 import logging
+from fcntl import flock, LOCK_UN, LOCK_EX, LOCK_NB
 import os
 import platform
 import subprocess
@@ -735,9 +737,10 @@ class LockFile(object):
     As we are a utility class to be derived from, we only use protected methods.
 
     Locks will automatically be released on destruction"""
-    __slots__ = ("_file_path", "_owns_lock")
+    __slots__ = ("_file_path", "_owns_lock", "_file_descriptor")
 
     def __init__(self, file_path):
+        self._file_descriptor = None
         self._file_path = file_path
         self._owns_lock = False
 
@@ -759,20 +762,24 @@ class LockFile(object):
         :raise IOError: if a lock was already present or a lock file could not be written"""
         if self._has_lock():
             return
+
         lock_file = self._lock_file_path()
-        if osp.isfile(lock_file):
-            raise IOError("Lock for file %r did already exist, delete %r in case the lock is illegal" %
-                          (self._file_path, lock_file))
+
+        # Create lock file
+        try:
+            open(lock_file, 'a').close()
+        except OSError as e:
+            # Silence error only if file exists
+            if e.errno != 17:  # 17 -> File exists
+                raise
 
         try:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-            if is_win:
-                flags |= os.O_SHORT_LIVED
-            fd = os.open(lock_file, flags, 0)
-            os.close(fd)
+            fd = os.open(lock_file, os.O_WRONLY, 0)
+            flock(fd, LOCK_EX | LOCK_NB)
         except OSError as e:
             raise IOError(str(e))
 
+        self._file_descriptor = fd
         self._owns_lock = True
 
     def _obtain_lock(self):
@@ -785,14 +792,15 @@ class LockFile(object):
         if not self._has_lock():
             return
 
-        # if someone removed our file beforhand, lets just flag this issue
-        # instead of failing, to make it more usable.
-        lfp = self._lock_file_path()
-        try:
-            rmfile(lfp)
-        except OSError:
-            pass
+        fd = self._file_descriptor
+        lock_file = self._lock_file_path()
+
+        flock(fd, LOCK_UN)
+        os.close(fd)
+        os.remove(lock_file)
+
         self._owns_lock = False
+        self._file_descriptor = None
 
 
 class BlockingLockFile(LockFile):
@@ -827,8 +835,8 @@ class BlockingLockFile(LockFile):
             try:
                 super(BlockingLockFile, self)._obtain_lock()
             except IOError:
-                # synity check: if the directory leading to the lockfile is not
-                # readable anymore, raise an exception
+                # sanity check: if the directory leading to the lockfile is not
+                # readable anymore, raise an execption
                 curtime = time.time()
                 if not osp.isdir(osp.dirname(self._lock_file_path())):
                     msg = "Directory containing the lockfile %r was not readable anymore after waiting %g seconds" % (
